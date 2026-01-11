@@ -5,7 +5,7 @@ For a full description of the assignment, see the assignment handout at
 
 If you see any issues with the assignment handout or code, please feel free to
 raise a GitHub issue or open a pull request with a fix.
-
+![](./assignment2_map.png)
 ## Setup
 
 This directory is organized as follows:
