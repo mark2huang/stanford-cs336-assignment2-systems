@@ -1,3 +1,80 @@
+import torch
+import os
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float32)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float16)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float16)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float16)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    x = torch.tensor(0.01,dtype=torch.float16)
+    s += x.type(torch.float32)
+print(s)
+
+
+"""
+案例1是传统FP32计算,精度高但慢
+
+案例2是从FP32降到FP16,当累加到某个点,再加一个很小的数,由于FP16精度不足以表示微小的增量,会发生“下溢”或被舍入
+
+案例3和案例4是混合精度,我们在训练时,可以使用 FP16 计算梯度
+但在更新参数时，必须把梯度加回到 FP32 的主权重上，只有这样，那些微小的梯度更新才不会被“舍入”掉，模型才能学到东西。
+"""
+
+
+
+
+
+"""
+with torch.autocast(device="cuda", dtype=torch.float16):
+    # 1. 矩阵乘法
+    a = torch.matmul(Q, K) 
+    # 2. 加上一个偏置
+    b = a + bias
+    # 3. 计算 Softmax
+    c = torch.softmax(b, dim=-1)
+autocast(dtype=torch.float16/torch.float32)函数的含义是:当系统决定要降精度时,请降到这个特定的类型(FP16 还是 BF16)”。
+而具体“哪些算子要降”,是由 autocast 内部的清单决定。
+
+白名单(自动转为低精度)：主要是矩阵乘法(matmul)、卷积(conv2d)、线性层(linear)。这些操作在 Tensor Cores 上跑得飞快，且对微小的精度损失不敏感。
+
+黑名单(强制留在 FP32)：主要是对数值范围敏感的函数，比如 softmax、layer_norm、exp、log、pow。这些函数如果用 FP16 跑，非常容易出现 NaN(溢出)或者结果完全错误。
+
+中立操作：比如 add(加法)。它们通常遵循输入张量的类型，如果输入有一个是 FP32,结果就是 FP32。
+"""
+
+
+
+import torch.nn as nn
+class ToyModel(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, 10, bias=False)
+        self.ln = nn.LayerNorm(10)
+        self.fc2 = nn.Linear(10, out_features, bias=False)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.ln(x)
+        x = self.fc2(x)
+        return x
+    
+
+
+
+
 import argparse
 import timeit
 import torch
@@ -6,7 +83,7 @@ import sys
 import pandas as pd
 import torch.nn as nn
 import os 
-
+from contextlib import nullcontext
 
 sys.path.append(os.path.join(os.path.dirname(__file__),"..","cs336-basics"))
 
@@ -136,9 +213,19 @@ def create_random_data(context_length, batch_size=BATCH_SIZE, vocab_size=VOCAB_S
 
 
 # setp8: 核心计时函数
-def run_benchmark(model, context_length, num_warmup_steps, num_measured_steps, mode,device):
+def run_benchmark(model, context_length, num_warmup_steps, num_measured_steps, mode,device,mixedPrecision):
 
     input_data = create_random_data(context_length, BATCH_SIZE, VOCAB_SIZE, device)
+
+    #确定精度上下文
+    if mixedPrecision=='true':
+        if device.type=='cuda':
+            device_type='cuda'
+        else:
+            device_type='cpu'
+        autocast_ctx=torch.autocast(device_type=device_type,dtype=torch.bfloat16)
+    else:
+        autocast_ctx=nullcontext()
 
     # 如果包含反向传播，需要准备优化器
     optimizer = None
@@ -149,12 +236,14 @@ def run_benchmark(model, context_length, num_warmup_steps, num_measured_steps, m
     # 定义“一个步骤”要做的事情，方便复用
     def run_one_step():
         if mode=="forward":
-            with torch.no_grad(): # 前向测试建议开启 no_grad 以免统计多余内存
-                _ = model(input_data)
+            with torch.no_grad(): # 前向测试开启 no_grad 以免统计多余内存
+                with autocast_ctx: #开启混合精度
+                    _ = model(input_data)
         else:
             optimizer.zero_grad() 
-            output = forward_pass(model,input_data)
-            loss = output.sum() 
+            with autocast_ctx: #开启混合精度
+                output = forward_pass(model,input_data)
+                loss = output.sum() 
             loss.backward()
             optimizer.step()
 
@@ -245,6 +334,7 @@ def main():
     parser.add_argument("--num_warmup", type=int, default=5)
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--device", type=str, choices=["cuda", "mps","cpu"], default="cpu")
+    parser.add_argument("--mixedPrecision",type=str,choices=["true","false"],default="false")
     args = parser.parse_args()
 
     #手动指定执行具体的模型
@@ -253,7 +343,7 @@ def main():
     select_config=MODEL_CONFIGS[args.size]
     model = create_model_with_random_weights(select_config,args.context_length)
     model.to(device)
-    records=run_benchmark(model, args.context_length, args.num_warmup, args.num_steps, args.mode,device)
+    records=run_benchmark(model, args.context_length, args.num_warmup, args.num_steps, args.mode,device,args.mixedPrecision)
     avg_records,std_records=calculate_stats(records)
     print(f"context_length: {args.context_length}")
     print(f"num_warmup: {args.num_warmup}")
@@ -261,6 +351,7 @@ def main():
     print(f"mode: {args.mode}")
     print(f"size: {args.size}")
     print(f"device: {device}")
+    print(f"device.type={device.type}")
     
 
     #自动化执行所有模型大小的跑分
@@ -293,59 +384,41 @@ if __name__ == "__main__":
     main()
 
 
-"""
-Q1:PDF 专门问了关于 Warm-up 的问题。你需要做一个对比：
-使用 --num_warmup 5(正常情况)
-使用 --num_warmup 0(不预热)
-观察点：如果不预热，第一步的时间通常会非常长（因为 GPU 需要初始化 Kernel),这会导致平均值被拉高。
-uv run python benchmarking.py --size small --mode forward --num_warmup 0 --device mps 
 
-avg_records: 280.622967
-std_records: 66.030199
-context_length: 512
-num_warmup: 0
-num_steps: 10
-mode: forward
-size: small
-device: mps
-
-
-uv run python benchmarking.py --size small --mode forward --num_warmup 5 --device mps
-avg_records: 259.492258
-std_records: 1.071463
-context_length: 512
-num_warmup: 5
-num_steps: 10
-mode: forward
-size: small
-device: mps
-
-
-Q2:Forward 和 Backward 分别花了多少时间？标准差是否很小？
-Running benchmark for small - forward...
-Running benchmark for small - forward_backward...
-Running benchmark for medium - forward...
-Running benchmark for medium - forward_backward...
-
---- Final Results Table ---
-|    | Model Size   | Mode             |   Avg (ms) |   Std (ms) |
-|---:|:-------------|:-----------------|-----------:|-----------:|
-|  0 | small        | forward          |     259.64 |       0.75 |
-|  1 | small        | forward_backward |     793.81 |       1.22 |
-|  2 | medium       | forward          |     766.87 |       4.38 |
-|  3 | medium       | forward_backward |    8616.75 |    7933.04 |
-
---- Pivot Table for Writeup ---
-| Model Size   |   forward |   forward_backward |
-|:-------------|----------:|-------------------:|
-| small        |    259.64 |             793.81 |
-| medium       |    766.87 |            8616.75 |
-| large        |    nan    |             nan    |
-| xl           |    nan    |             nan    |
-| 2.7B         |    nan    |             nan    |
-
-
-small model forward_backward ≈ 3 times slower than forward 并且计算波动小
-medium model forward_backward ≈ 11 times slower than forward 并且计算波动大,这反映了在本地统一内存环境下,大模型计算触发了系统的内存交换机制(Swap)或热限制,导致计算延迟出现了显著的非线性波动
 
 """
+Writeup:
+Suppose we are training the model on a GPU and that the model parameters are originally in
+FP32. We’d like to use autocasting mixed precision with FP16. What are the data types of:
+• the model parameters within the autocast context,FP32     注：当代码运行到第 10 行执行 fc1(x)（矩阵乘法）时，它会在后台临时创建一个参数的 FP16 副本进行计算。计算一结束，这个副本就被丢弃了。从用户的视角看，或者从 model.parameters() 的属性看，参数永远是 FP32。它不会在模型里持久化存一份 FP16 的 weight。
+• the output of the first feed-forward layer (ToyModel.fc1),FP16
+• the output of layer norm (ToyModel.ln),FP32
+• the model’s predicted logits,FP32
+• the loss,FP32
+• and the model’s gradients? FP32
+Deliverable: The data types for each of the components listed above.
+
+
+
+b) You should have seen that FP16 mixed precision autocasting treats the layer normalization layer
+differently than the feed-forward layers. What parts of layer normalization are sensitive to mixed
+precision? If we use BF16 instead of FP16, do we still need to treat layer normalization differently?
+Why or why not?
+Deliverable: A 2-3 sentence response.
+An:
+不能使用FP16,因为layerNorm其中要计算向量的方差,涉及平方的操作,如果使用FP16,容易出现数值溢出的问题
+也不能使用BP16,虽然 BF16 的动态范围和 FP32 一样大，不容易溢出，但 BF16 的精度（尾数位）非常低（只有 7 位)。在计算均值和方差这种对精确度要求极高的统计量时,BF16 可能会引入不可忽视的噪声。
+
+(c) Modify your benchmarking script to optionally run the model using mixed precision with BF16.
+Time the forward and backward passes with and without mixed-precision for each language model
+size described in §1.1.2. Compare the results of using full vs. mixed precision, and comment on
+any trends as model size changes. You may find the nullcontext no-op context manager to be
+useful.
+Deliverable: A 2-3 sentence response with your timings and commentary.
+随着模型尺寸（从 small 到 xl)的增加,你会发现：
+加速比增加:大模型中矩阵乘法(Matmul)占总计算量的比例更高,BF16 能通过 Tensor Cores 带来更显著的吞吐量提升。
+显存节省：虽然参数仍是 FP32,但**激活值(Activations)**变为了 16 位，显著降低了显存压力，使得在 FP32 下 OOM 的长序列在 BF16 下可以运行。
+
+"""
+
+
