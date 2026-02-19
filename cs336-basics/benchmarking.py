@@ -16,6 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__),"..","cs336-basics"))
 
 try:
     from cs336_basics.model import BasicsTransformerLM
+    print("BasicsTransformerLM has been imported Successfully")
 except ImportError:
     print("Error: cs336_basics package not found. Please make sure it's installed.")
     sys.exit(1)
@@ -23,10 +24,9 @@ except ImportError:
 # step2:  导入assignment1中自己写好的run_transformer_lm
 assignment1_root = "/Users/hcb/Desktop/AI/跟着斯坦福/CS336/assignment1-basics-main"
 sys.path.insert(0,assignment1_root)
-print(f"sys.path={sys.path}")
 from tests.adapters import run_transformer_lm
 
-# --- 包装类 ---
+# 导入assignment1里面做好的model
 class MyAssignment1Model(nn.Module):
     def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta):
         super().__init__()

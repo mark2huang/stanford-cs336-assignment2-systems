@@ -1,5 +1,2 @@
 Model Size,Mode,Avg (ms),Std (ms)
-small,forward,259.64,0.75
-small,forward_backward,793.81,1.22
-medium,forward,766.87,4.38
-medium,forward_backward,8616.75,7933.04
+small,forward,1370.11,59.37
