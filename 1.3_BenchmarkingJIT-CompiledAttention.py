@@ -184,7 +184,7 @@ def weight_sum_fwd(
         strides=(weight_stride_dim,),
         offsets=(0,),
         block_shape=(D_TILE_SIZE,),
-        orser=(0,),
+        order=(0,),
     )
 
     output_block_ptr=tl.make_block_ptr(
@@ -193,7 +193,7 @@ def weight_sum_fwd(
         strides=(output_stride_row,),
         offsets=(row_tile_idx * ROWS_TILE_SIZE,),
         block_shape=(ROWS_TILE_SIZE,),
-        orser=(0,),
+        order=(0,),
     )
     #初始化一个缓冲区用于写入结果
     output=tl.zeros((ROWS_TILE_SIZE,),dtype=tl.float32)
@@ -211,6 +211,91 @@ def weight_sum_fwd(
         weight_block_ptr=weight_block_ptr.advance((D_TILE_SIZE,))
     #将结果写回输出快指针
     tl.store(output_block_ptr,output,boundary_check=(0,))
+
+
+@triton
+def weighted_sum_backward(
+    x_ptr,weight_ptr, #input
+    grad_output_ptr, # Grad input
+    grad_x_ptr,partial_grad_weight_ptr,#Grad outputs
+    stride_xr,stride_xd,
+    stride_wd,
+    stride_gr,
+    stride_gxr,stride_gxd,
+    stride_gwb,stride_gwd,
+    NUM_ROWS,D,#3,2
+    ROWS_TILE_SIZE:tl.constexpr,D_TILE_SIZE:tl.constexpr,#Tile Size 必须是 2 的幂，ROWS_TILE_SIZE=1，D_TILE_SIZE=2
+):
+    row_tile_idx=tl.program_id(0)
+    n_row_tiles=tl.num_programs(0)
+
+    #计算X的梯度wj⋅gi
+    #计算weight的梯度sum(xij*gi)
+    #Inputs X=3*2
+    #weight=2*1
+    #weight_sum/ouput/gradout=3*1
+    """
+    场景:假设3*2矩阵计算完后.得到了一个长度为 3 的输出向量y
+    输入梯度：现在反向传播传回了一个长度为 3 的梯度向量 grad_output = [g0, g1, g2]
+    """
+    grad_output_block_ptr=tl.make_block_ptr(
+        base=grad_output_ptr,#地图的起点：整个向量在显存里的“门牌号”起点
+        shape=(NUM_ROWS,),#地图的全长：告诉 GPU 这条数据总共有多长，别跑丢了
+        strides=(stride_gr,),#步长：从一个梯度值走到下一个梯度值，需要跨过多少个地址空间
+        offsets=(row_tile_idx*ROWS_TILE_SIZE,),#当前工人的起始点：工人i应该从第几个梯度开始看
+        block_shape=(ROWS_TILE_SIZE,),#手电筒的宽度：工人一次性能看几个梯度值？
+        order=(0,),#扫描方向：数据是按什么顺序排的？（1D 只有一种排法）
+    )
+    x_block_ptr=tl.make_block_ptr(
+        base=x_ptr,
+        shape=(NUM_ROWS,D,),
+        strides=(stride_xr,stride_xd),
+        offsets=(row_tile_idx*ROWS_TILE_SIZE,0),
+        block_shape=(ROWS_TILE_SIZE,D_TILE_SIZE),
+        order=(1,0),
+    )
+    weight_block_ptr=tl.make_block_ptr(
+        base=weight_ptr,
+        shape=(D,),#如果你的 shape 只有一个数（一维），那么你的 offsets 和 block_shape 也只能有一个数
+        strides=(stride_wd,),
+        offsets=(0,),
+        block_shape=(D_TILE_SIZE,),
+        order=(0,),
+    )
+    grad_x_block_ptr=tl.make_block_ptr(
+        base=grad_x_ptr,
+        shape=(NUM_ROWS,D,),
+        strides=(stride_gxr,stride_gxd),
+        offsets=(row_tile_idx*ROWS_TILE_SIZE,0),
+        block_shape=(ROWS_TILE_SIZE,D_TILE_SIZE),
+        order=(1,0),
+    )
+    partial_grad_weight_block_ptr=tl.make_block_ptr( #根据公式 (3)，权重 w的梯度是所有行累加的结果。由于每个工人处理不同的行，他们每个人都会算出一个对w的“局部贡献”,所以让每个工人把自己的计算结果写到一个叫 partial_grad_weight_ptr 的缓冲区里
+        base=partial_grad_weight_ptr,
+        shape=(NUM_ROWS,D,),
+        strides=(stride_gwb,stride_gwd),
+        offsets=(row_tile_idx,0),
+        block_shape=(1,D_TILE_SIZE),
+        order=(1,0),
+
+    )
+    for i in range(tl.cdiv(D,D_TILE_SIZE)):
+        grad_output=tl.load(grad_output_block_ptr,boundary_check=(0,),padding_option="zero") #(ROWS_TILE_SIZE,)
+        #Outer product for grad_x
+        weight=tl.load(weight.block_ptr,boundary_check=(0,),padding_option="zero")#(D_TILE_SIZE,)
+        grad_x_row=grad_output[:,None]*weight[None,:]
+        tl.store(grad_x_block_ptr,grad_x_row,boundary_check=(0,1))
+        # Reduce as many rows as possible for the grad_weight result
+        row=tl.load(x_block_ptr,boundary_check=(0,1),padding_option="zero")#(ROWS_TILE_SIZE,D_TILE_SIZE)
+        grad_weight_row=tl.sum(row*grad_output[:,None],axis=0,keep_dims=True)
+        tl.store(partial_grad_weight_block_ptr,grad_weight_row,boundary_check=(1,))# Never out of bounds for dim 0
+        # Move the pointers to the next tile along D
+        x_block_ptr=x_block_ptr.advance((0,D_TILE_SIZE))
+        weight_block_ptr=weight_block_ptr.advance((D_TILE_SIZE,))
+        partial_grad_weight_block_ptr=partial_grad_weight_block_ptr.advance((0,D))
+        grad_x_block_ptr=grad_x_block_ptr.advance((0,D_TILE_SIZE))
+
+
 
 class WeightedSumFunc(torch.autograd.Function):
     @staticmethod
@@ -252,12 +337,35 @@ class WeightedSumFunc(torch.autograd.Function):
             ROWS_TILE_SIZE=ctx.ROWS_TILE_SIZE,D_TILE_SIZE=ctx.D_TILE_SIZE,
         )
         return y.view(input_shape[:-1])#view把它还原成原始的形状
-    
-    
+        
+    @staticmethod
+    def backward(ctx,grad_out):
+        x,weight=ctx.saved_tensors
+        ROWS_TILE_SIZE,D_TILE_SIZE=ctx.ROWS_TILE_SIZE,ctx.D_TILE_SIZE
+        n_rows, D = x.shape
+
+        # Our strategy is for each thread block to first write to a partial buffer,
+        #then we reduce over this buffer to get the final gradient.
+        partial_grad_weight = torch.empty((cdiv(n_rows, ROWS_TILE_SIZE), D), device=x.device, dtype=x.dtype)
+        grad_x = torch.empty_like(x)
+        weighted_sum_backward[(tl.cdiv(n_rows, ROWS_TILE_SIZE),)](
+            x, weight,
+            grad_out,
+            grad_x, partial_grad_weight,
+            x.stride(0), x.stride(1),
+            weight.stride(0),
+            grad_out.stride(0),
+            grad_x.stride(0), grad_x.stride(1),
+            partial_grad_weight.stride(0), partial_grad_weight.stride(1),
+            NUM_ROWS=n_rows, D=D,
+            ROWS_TILE_SIZE=ROWS_TILE_SIZE, D_TILE_SIZE=D_TILE_SIZE,
+            )
+        grad_weight = partial_grad_weight.sum(axis=0)
+        return grad_x, grad_weight
     
 
 
-
+        
     
 
 
