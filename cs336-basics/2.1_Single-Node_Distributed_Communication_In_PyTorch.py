@@ -98,6 +98,7 @@ if __name__ == "__main__":
 
 
 
+#以下请在有NVIDIA GPU的机器上测试
 import os
 import torch
 import torch.distributed as dist
